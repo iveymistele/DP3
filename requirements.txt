@@ -1,0 +1,7 @@
+pandas>=2.0
+requests
+duckdb
+prefect==2.11.0
+matplotlib
+python-dateutil
+tldextract
