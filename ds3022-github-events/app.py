@@ -5,7 +5,7 @@ import plotly.express as px
 from shinywidgets import output_widget, render_widget
 
 # Connect to the DuckDB database
-con = duckdb.connect("data/github.duckdb")
+con = duckdb.connect("data/github.duckdb", read_only=True)
 DB_PATH = "data/github.duckdb"
 
 app_ui = ui.page_fluid(
