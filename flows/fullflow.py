@@ -4,6 +4,10 @@ import requests, time, pandas as pd, duckdb
 from datetime import datetime, timezone
 from prefect.blocks.system import Secret
 
+# -------------------------
+# Configuration
+# -------------------------
+
 REPOS = [
     "torvalds/linux",
     "microsoft/vscode",
@@ -17,40 +21,43 @@ REPOS = [
     "godotengine/godot"
 ]
 
-
 BASE_URL = "https://api.github.com/repos/{repo}/events"
-DB_PATH = "data/github.duckdb"
+S3_DB_PATH = "s3://mistelehendershot-dp3/github.duckdb"
+AWS_REGION = "us-east-1"
 
-secret_block = Secret.load("github-pat")
+# Load secrets from Prefect Cloud
+GITHUB_PAT = Secret.load("github-pat").get()
+AWS_ACCESS_KEY = Secret.load("aws-pubkey").get()
+AWS_SECRET_KEY = Secret.load("aws-secretkey").get()
 
-# Access the stored secret
-TOKEN = secret_block.get()
 headers = {
     "Accept": "application/vnd.github+json",
-    "Authorization": f"Bearer {TOKEN}"
+    "Authorization": f"Bearer {GITHUB_PAT}"
 }
 
 RECORD_LIMIT = 300
 SLEEP_AFTER_RUN = 120
 
 
-# Tasks ------------------
+# -------------------------
+# Tasks
+# -------------------------
 
 @task(retries=3, retry_delay_seconds=15)
 def fetch_repo_events(repo_name: str, max_pages: int = 5):
-    """Fetch GitHub events for a repo with pagination and rate-limit handling."""
+    """Fetch GitHub events with rate-limit handling."""
     all_events = []
 
     for page in range(1, max_pages + 1):
         url = f"{BASE_URL.format(repo=repo_name)}?per_page=100&page={page}"
         r = requests.get(url, headers=headers)
 
-        # Handle rate limits
+        # Rate limits
         if r.status_code == 403:
             reset_time = r.headers.get("X-RateLimit-Reset")
             if reset_time:
                 wait_sec = max(
-                    (datetime.fromtimestamp(int(reset_time), tz=timezone.utc) - 
+                    (datetime.fromtimestamp(int(reset_time), tz=timezone.utc) -
                      datetime.now(timezone.utc)).total_seconds(),
                     60
                 )
@@ -58,7 +65,7 @@ def fetch_repo_events(repo_name: str, max_pages: int = 5):
                 time.sleep(wait_sec)
                 return fetch_repo_events.fn(repo_name, max_pages=max_pages)
             else:
-                print(f"⚠️ 403 for {repo_name}, sleeping 5 minutes.")
+                print("⚠️ 403 with no reset header — sleeping 5 min.")
                 time.sleep(300)
                 return fetch_repo_events.fn(repo_name, max_pages=max_pages)
 
@@ -72,35 +79,54 @@ def fetch_repo_events(repo_name: str, max_pages: int = 5):
 
         all_events.extend(events)
 
+        # Respect GitHub polling interval
         poll_interval = int(r.headers.get("X-Poll-Interval", "60"))
         time.sleep(poll_interval)
 
-    print(f"{repo_name}: fetched {len(all_events)} total events.")
+    print(f"{repo_name}: fetched {len(all_events)} events.")
     return all_events
 
 
 @task
 def flatten_events(events, repo_name):
-    """Flatten GitHub event JSON to rows."""
+    """Flatten GitHub API JSON."""
     rows = [{
-            "id": e.get("id"),
-            "type": e.get("type"),
-            "repo": e.get("repo", {}).get("name", repo_name),
-            "actor": e.get("actor", {}).get("login"),
-            "org": e.get("org", {}).get("login"),
-            "created_at": e.get("created_at"),
-            "action": e.get("payload", {}).get("action"),
-            "ref": e.get("payload", {}).get("ref"),
-            "ref_type": e.get("payload", {}).get("ref_type"),
-            "inserted_at": datetime.utcnow(),
-        } for e in events]
+        "id": e.get("id"),
+        "type": e.get("type"),
+        "repo": e.get("repo", {}).get("name", repo_name),
+        "actor": e.get("actor", {}).get("login"),
+        "org": e.get("org", {}).get("login"),
+        "created_at": e.get("created_at"),
+        "action": e.get("payload", {}).get("action"),
+        "ref": e.get("payload", {}).get("ref"),
+        "ref_type": e.get("payload", {}).get("ref_type"),
+        "inserted_at": datetime.utcnow(),
+    } for e in events]
+
     return pd.DataFrame(rows)
 
 
 @task
-def append_duckdb(df):
-    conn = duckdb.connect(DB_PATH)
+def append_duckdb_s3(df):
+    """Append a DataFrame to the DuckDB stored in S3."""
+    # Connect to an *in-memory* database first
+    conn = duckdb.connect(":memory:")
 
+    # Enable S3 support
+    conn.execute("INSTALL httpfs;")
+    conn.execute("LOAD httpfs;")
+    conn.execute(f"SET s3_region='{AWS_REGION}';")
+    conn.execute(f"SET s3_access_key_id='{AWS_ACCESS_KEY}';")
+    conn.execute(f"SET s3_secret_access_key='{AWS_SECRET_KEY}';")
+
+    # Try loading existing DB (if exists)
+    try:
+        conn.execute(f"IMPORT DATABASE '{S3_DB_PATH}';")
+        print("Loaded existing DuckDB from S3.")
+    except Exception:
+        print("No existing DB — creating new one.")
+
+    # Ensure table exists
     conn.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id VARCHAR,
@@ -113,19 +139,23 @@ def append_duckdb(df):
             ref VARCHAR,
             ref_type VARCHAR,
             inserted_at TIMESTAMP
-        )
+        );
     """)
 
+    # Append data
     conn.register("df_view", df)
-    conn.execute("INSERT INTO events SELECT * FROM df_view")
+    conn.execute("INSERT INTO events SELECT * FROM df_view;")
+
+    # Export UPDATED database to S3
+    conn.execute(f"EXPORT DATABASE '{S3_DB_PATH}' (FORMAT PARQUET);")
+
     conn.close()
-
-    print(f"[+] Inserted {len(df)} rows into DuckDB.")
-
+    print(f"[+] Inserted {len(df)} rows into DuckDB (S3).")
 
 
-# Flow -------------------------------------
-
+# -------------------------
+# Flow
+# -------------------------
 
 @flow(name="github-events-poller")
 def github_events_flow():
@@ -136,19 +166,20 @@ def github_events_flow():
         df = flatten_events(events, repo)
         count = len(df)
 
-        append_duckdb(df)
+        append_duckdb_s3(df)
 
         total_records += count
-        print(f"{repo}: {count} events inserted (running total {total_records})")
+        print(f"{repo}: {count} rows inserted (total {total_records})")
 
         if total_records >= RECORD_LIMIT:
-            print(f"Record limit {RECORD_LIMIT} reached. Stopping early.")
+            print("Record limit reached — stopping.")
             break
 
         time.sleep(1)
 
     print(f"Sleeping {SLEEP_AFTER_RUN}s before exit...")
     time.sleep(SLEEP_AFTER_RUN)
+
 
 
 if __name__ == "__main__":
