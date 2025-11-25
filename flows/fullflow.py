@@ -148,8 +148,8 @@ def append_duckdb_s3(df):
         (
             FORMAT PARQUET,
             AWS_REGION 'us-east-1',
-            AWS_ACCESS_KEY_ID '{aws_creds.access_key}',
-            AWS_SECRET_ACCESS_KEY '{aws_creds.secret_access_key}'
+            AWS_ACCESS_KEY_ID '{aws_creds.aws_access_key_id}',
+            AWS_SECRET_ACCESS_KEY '{aws_creds.aws_secret_access_key}'
         );
     """)
 
