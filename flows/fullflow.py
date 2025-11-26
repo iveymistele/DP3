@@ -142,19 +142,21 @@ def append_duckdb_s3(df):
     conn.register("df_view", df)
     conn.execute("INSERT INTO events SELECT * FROM df_view")
 
-    # 4. Export to S3 (THIS is the important part)
+    # 4. Export to S3 
+    conn.execute(f"SET s3_region='us-east-1';")
+    conn.execute(f"SET s3_access_key_id='{aws_creds.aws_access_key_id}';")
+    conn.execute(f"SET s3_secret_access_key='{aws_creds.aws_secret_access_key}';")
+    conn.execute(f"SET s3_url_style='path';")     # often required
+    conn.execute(f"SET s3_use_ssl=true;")
+
     conn.execute(f"""
         EXPORT DATABASE '{S3_DB_PATH}'
-        (
-            FORMAT PARQUET,
-            AWS_REGION 'us-east-1',
-            AWS_ACCESS_KEY_ID '{aws_creds.aws_access_key_id}',
-            AWS_SECRET_ACCESS_KEY '{aws_creds.aws_secret_access_key}'
-        );
+        (FORMAT PARQUET);
     """)
 
+
     conn.close()
-    print("✓ Exported DuckDB database to S3")
+    print("Exported DuckDB database to S3")
 
 
 
