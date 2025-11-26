@@ -143,16 +143,18 @@ def append_duckdb_s3(df):
     conn.execute("INSERT INTO events SELECT * FROM df_view")
 
     # 4. Export to S3 
+    S3_BUCKET = "mistelehendershot-dp3"      
+    S3_PREFIX = "duckdb_export"             # folder inside bucket
+
     conn.execute(f"SET s3_region='us-east-1';")
     conn.execute(f"SET s3_access_key_id='{aws_creds.aws_access_key_id}';")
     conn.execute(f"SET s3_secret_access_key='{aws_creds.aws_secret_access_key}';")
-    conn.execute(f"SET s3_url_style='path';")     # often required
-    conn.execute(f"SET s3_use_ssl=true;")
 
     conn.execute(f"""
-        EXPORT DATABASE '{S3_DB_PATH}'
+        EXPORT DATABASE 's3://{S3_BUCKET}/{S3_PREFIX}'
         (FORMAT PARQUET);
     """)
+
 
 
     conn.close()
