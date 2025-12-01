@@ -2,7 +2,10 @@
 from prefect import flow, task
 import requests, time, pandas as pd, duckdb
 from datetime import datetime, timezone
-from prefect.blocks.system import Secret
+from dotenv import load_dotenv
+load_dotenv()
+
+import os
 
 # -------------------------
 # Configuration
@@ -22,11 +25,24 @@ REPOS = [
 ]
 
 BASE_URL = "https://api.github.com/repos/{repo}/events"
-S3_DB_PATH = "s3://mistelehendershot-dp3/github.duckdb"
+
+# Local + S3 paths
+LOCAL_DB = "local.duckdb"
+S3_BUCKET = "mistelehendershot-dp3"
+S3_PREFIX = "duckdb_export"
 AWS_REGION = "us-east-1"
 
-# Load secrets from Prefect Cloud
-GITHUB_PAT = Secret.load("github-pat").get()
+# GitHub PAT
+GITHUB_PAT = os.getenv("GITHUB_PAT")
+if not GITHUB_PAT:
+    raise ValueError("Missing GITHUB_PAT environment variable!")
+
+# AWS credentials from environment variables
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET = os.getenv("AWS_SECRET_ACCESS_KEY")
+
+if not AWS_ACCESS_KEY or not AWS_SECRET:
+    raise ValueError("Missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY in environment!")
 
 headers = {
     "Accept": "application/vnd.github+json",
@@ -34,8 +50,6 @@ headers = {
 }
 
 RECORD_LIMIT = 300
-SLEEP_AFTER_RUN = 120
-
 
 # -------------------------
 # Tasks
@@ -50,20 +64,18 @@ def fetch_repo_events(repo_name: str, max_pages: int = 5):
         url = f"{BASE_URL.format(repo=repo_name)}?per_page=100&page={page}"
         r = requests.get(url, headers=headers)
 
-        # Rate limits
         if r.status_code == 403:
             reset_time = r.headers.get("X-RateLimit-Reset")
             if reset_time:
                 wait_sec = max(
                     (datetime.fromtimestamp(int(reset_time), tz=timezone.utc) -
-                     datetime.now(timezone.utc)).total_seconds(),
-                    60
+                     datetime.now(timezone.utc)).total_seconds(), 60
                 )
-                print(f"⚠️ Rate limit hit for {repo_name}. Waiting {int(wait_sec)}s.")
+                print(f"Rate limit hit for {repo_name}. Sleeping {int(wait_sec)}s.")
                 time.sleep(wait_sec)
                 return fetch_repo_events.fn(repo_name, max_pages=max_pages)
             else:
-                print("⚠️ 403 with no reset header — sleeping 5 min.")
+                print("403 no reset header — sleeping 5m.")
                 time.sleep(300)
                 return fetch_repo_events.fn(repo_name, max_pages=max_pages)
 
@@ -77,50 +89,43 @@ def fetch_repo_events(repo_name: str, max_pages: int = 5):
 
         all_events.extend(events)
 
-        # Respect GitHub polling interval
         poll_interval = int(r.headers.get("X-Poll-Interval", "60"))
         time.sleep(poll_interval)
 
-    print(f"{repo_name}: fetched {len(all_events)} events.")
+    print(f"{repo_name}: {len(all_events)} events.")
     return all_events
 
 
 @task
 def flatten_events(events, repo_name):
-    """Flatten GitHub API JSON."""
-    rows = [{
-        "id": e.get("id"),
-        "type": e.get("type"),
-        "repo": e.get("repo", {}).get("name", repo_name),
-        "actor": e.get("actor", {}).get("login"),
-        "org": e.get("org", {}).get("login"),
-        "created_at": e.get("created_at"),
-        "action": e.get("payload", {}).get("action"),
-        "ref": e.get("payload", {}).get("ref"),
-        "ref_type": e.get("payload", {}).get("ref_type"),
-        "inserted_at": datetime.utcnow(),
-    } for e in events]
+    rows = []
+    for e in events:
+        repo_full = e.get("repo", {}).get("name", repo_name)
+        parsed_org = repo_full.split("/")[0] if "/" in repo_full else None
+        
+        rows.append({
+            "id": e.get("id"),
+            "type": e.get("type"),
+            "repo": repo_full,
+            "actor": e.get("actor", {}).get("login"),
+            "org": parsed_org,
+            "created_at": e.get("created_at"),
+            "action": e.get("payload", {}).get("action"),
+            "ref": e.get("payload", {}).get("ref"),
+            "ref_type": e.get("payload", {}).get("ref_type"),
+            "inserted_at": datetime.utcnow(),
+        })
 
     return pd.DataFrame(rows)
 
 
-from prefect_aws import AwsCredentials
-from prefect_aws.s3 import S3Bucket
 
 @task
-def append_duckdb_s3(df):
+def append_and_export(df):
+    """Append events to local DuckDB and export to S3."""
+    # Local DB
+    conn = duckdb.connect(LOCAL_DB)
 
-    # Load AWS credentials and S3 bucket block
-    aws_creds = AwsCredentials.load("aws-creds")
-    s3 = S3Bucket.load("dp3-bucket")
-
-    # This is your S3 DuckDB destination folder
-    S3_DB_PATH = "s3://mistelehendershot-dp3/github.duckdb/"
-
-    # 1. Create or connect to a local DuckDB file inside the container
-    conn = duckdb.connect("local.duckdb")
-
-    # 2. Make table if missing
     conn.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id VARCHAR,
@@ -136,35 +141,32 @@ def append_duckdb_s3(df):
         )
     """)
 
-    # 3. Insert data
     conn.register("df_view", df)
     conn.execute("INSERT INTO events SELECT * FROM df_view")
 
-    # 4. Export to S3 
-    S3_BUCKET = "mistelehendershot-dp3"      
-    S3_PREFIX = "duckdb_export"             # folder inside bucket
+    # Configure S3
+    conn.execute(f"SET s3_region='{AWS_REGION}';")
+    conn.execute(f"SET s3_access_key_id='{AWS_ACCESS_KEY}';")
+    conn.execute(f"SET s3_secret_access_key='{AWS_SECRET}';")
 
-    conn.execute(f"SET s3_region='us-east-1';")
-    conn.execute(f"SET s3_access_key_id='{aws_creds.aws_access_key_id}';")
-    conn.execute(f"SET s3_secret_access_key='{aws_creds.aws_secret_access_key}';")
+    # Export to your bucket
+    s3_path = f"s3://{S3_BUCKET}/{S3_PREFIX}"
+    print(f"Exporting DuckDB to {s3_path} ...")
 
     conn.execute(f"""
-        EXPORT DATABASE 's3://{S3_BUCKET}/{S3_PREFIX}'
+        EXPORT DATABASE '{s3_path}'
         (FORMAT PARQUET);
     """)
 
-
-
     conn.close()
-    print("Exported DuckDB database to S3")
-
+    print("Exported to S3.")
 
 
 # -------------------------
 # Flow
 # -------------------------
 
-@flow(name="github-events-poller")
+@flow(name="github-events-local-s3")
 def github_events_flow():
     total_records = 0
 
@@ -173,21 +175,25 @@ def github_events_flow():
         df = flatten_events(events, repo)
         count = len(df)
 
-        append_duckdb_s3(df)
+        append_and_export(df)
 
         total_records += count
-        print(f"{repo}: {count} rows inserted (total {total_records})")
+        print(f"{repo}: {count} rows added (total {total_records})")
 
         if total_records >= RECORD_LIMIT:
-            print("Record limit reached — stopping.")
+            print("Limit reached.")
             break
 
         time.sleep(1)
 
-    print(f"Sleeping {SLEEP_AFTER_RUN}s before exit...")
-    time.sleep(SLEEP_AFTER_RUN)
+    print("Flow finished.")
 
 
-
+# -------------------------
+# Serve locally
+# -------------------------
 if __name__ == "__main__":
-    github_events_flow()
+    github_events_flow.serve(
+        name="local-github-s3-service",
+        schedule=None
+    )
