@@ -130,6 +130,7 @@ def server(input, output, session):
                 COUNT(*) AS count
             FROM read_parquet('{S3_PATH}')
             WHERE created_at IS NOT NULL
+            AND created_at >= now() - INTERVAL 2 DAY
             GROUP BY minute
             ORDER BY minute
         """)
